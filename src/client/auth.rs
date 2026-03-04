@@ -90,9 +90,20 @@ impl SecurityType {
                 }
                 let mut sec_types = vec![];
                 for _ in 0..num {
-                    sec_types.push(reader.read_u8().await?.try_into()?);
+                    let byte = reader.read_u8().await?;
+                    match byte.try_into() {
+                        Ok(st) => sec_types.push(st),
+                        Err(_) => {
+                            tracing::debug!("Skipping unknown security type: {}", byte);
+                        }
+                    }
                 }
                 tracing::trace!("Server supported security type: {:?}", sec_types);
+                if sec_types.is_empty() {
+                    return Err(VncError::General(
+                        "No supported security type offered by server".to_string(),
+                    ));
+                }
                 Ok(sec_types)
             }
         }
