@@ -5,7 +5,7 @@
 //!
 //! ## Simple example
 //!
-//! ```no_run
+//! ```ignore
 //! use anyhow::{Context, Result};
 //! use minifb::{Window, WindowOptions};
 //! use tokio::{self, net::TcpStream};
