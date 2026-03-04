@@ -1,6 +1,7 @@
 use super::{
     auth::{AuthHelper, AuthResult, SecurityType},
     connection::VncClient,
+    security,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -56,17 +57,12 @@ where
                     assert!(!security_types.is_empty());
 
                     if security_types.contains(&SecurityType::None) {
+                        // No authentication needed
                         match connector.rfb_version {
                             VncVersion::RFB33 => {
-                                // If the security-type is 1, for no authentication, the server does not
-                                // send the SecurityResult message but proceeds directly to the
-                                // initialization messages (Section 7.3).
                                 info!("No auth needed in vnc3.3");
                             }
                             VncVersion::RFB37 => {
-                                // After the security handshake, if the security-type is 1, for no
-                                // authentication, the server does not send the SecurityResult message
-                                // but proceeds directly to the initialization messages (Section 7.3).
                                 info!("No auth needed in vnc3.7");
                                 SecurityType::write(&SecurityType::None, &mut connector.stream)
                                     .await?;
@@ -79,29 +75,31 @@ where
                                 connector.stream.read_exact(&mut ok).await?;
                             }
                         }
-                    } else {
-                        // choose a auth method
-                        if security_types.contains(&SecurityType::VncAuth) {
-                            if connector.rfb_version != VncVersion::RFB33 {
-                                // In the security handshake (Section 7.1.2), rather than a two-way
-                                // negotiation, the server decides the security type and sends a single
-                                // word:
+                    } else if security_types.contains(&SecurityType::AppleRemoteDesktop) {
+                        // Apple Remote Desktop (ARD) authentication — type 30
+                        if connector.rfb_version != VncVersion::RFB33 {
+                            SecurityType::write(
+                                &SecurityType::AppleRemoteDesktop,
+                                &mut connector.stream,
+                            )
+                            .await?;
+                        }
 
-                                //            +--------------+--------------+---------------+
-                                //            | No. of bytes | Type [Value] | Description   |
-                                //            +--------------+--------------+---------------+
-                                //            | 4            | U32          | security-type |
-                                //            +--------------+--------------+---------------+
-
-                                // The security-type may only take the value 0, 1, or 2.  A value of 0
-                                // means that the connection has failed and is followed by a string
-                                // giving the reason, as described in Section 7.1.2.
-                                SecurityType::write(&SecurityType::VncAuth, &mut connector.stream)
-                                    .await?;
-                            }
+                        if let Some((ref username, ref password)) = connector.ard_credentials {
+                            security::ard::authenticate_ard(
+                                &mut connector.stream,
+                                username,
+                                password,
+                            )
+                            .await?;
                         } else {
-                            let msg = "Security type apart from Vnc Auth has not been implemented";
-                            return Err(VncError::General(msg.to_owned()));
+                            return Err(VncError::ArdCredentialsRequired);
+                        }
+                    } else if security_types.contains(&SecurityType::VncAuth) {
+                        // Standard VNC Auth
+                        if connector.rfb_version != VncVersion::RFB33 {
+                            SecurityType::write(&SecurityType::VncAuth, &mut connector.stream)
+                                .await?;
                         }
 
                         // get password
@@ -117,9 +115,6 @@ where
                         let result = auth.finish(&mut connector.stream).await?;
                         if let AuthResult::Failed = result {
                             if let VncVersion::RFB37 = connector.rfb_version {
-                                // In VNC Authentication (Section 7.2.2), if the authentication fails,
-                                // the server sends the SecurityResult message, but does not send an
-                                // error message before closing the connection.
                                 return Err(VncError::WrongPassword);
                             } else {
                                 let _ = connector.stream.read_u32().await?;
@@ -128,7 +123,11 @@ where
                                 return Err(VncError::General(err_msg));
                             }
                         }
+                    } else {
+                        let msg = "No supported security type offered by server";
+                        return Err(VncError::General(msg.to_owned()));
                     }
+
                     info!("auth done, client connected");
 
                     Ok(VncState::Connected(
@@ -163,6 +162,7 @@ where
 {
     stream: S,
     auth_methond: Option<F>,
+    ard_credentials: Option<(String, String)>,
     rfb_version: VncVersion,
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
@@ -205,6 +205,7 @@ where
         Self {
             stream,
             auth_methond: None,
+            ard_credentials: None,
             allow_shared: true,
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
@@ -253,6 +254,19 @@ where
     ///
     pub fn set_auth_method(mut self, auth_callback: F) -> Self {
         self.auth_methond = Some(auth_callback);
+        self
+    }
+
+    /// Set Apple Remote Desktop (ARD) credentials for macOS Screen Sharing.
+    ///
+    /// ARD uses security type 30 with Diffie-Hellman key exchange and
+    /// AES-encrypted username/password authentication.
+    ///
+    /// If the server offers ARD auth and these credentials are set, they will be used.
+    /// If the server offers ARD auth but no credentials are set, an
+    /// `ArdCredentialsRequired` error is returned.
+    pub fn set_ard_credentials(mut self, username: String, password: String) -> Self {
+        self.ard_credentials = Some((username, password));
         self
     }
 

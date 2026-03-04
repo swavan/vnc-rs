@@ -4,29 +4,39 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub(super) enum SecurityType {
-    Invalid = 0,
-    None = 1,
-    VncAuth = 2,
-    RA2 = 5,
-    RA2ne = 6,
-    Tight = 16,
-    Ultra = 17,
-    Tls = 18,
-    VeNCrypt = 19,
-    GtkVncSasl = 20,
-    Md5Hash = 21,
-    ColinDeanXvp = 22,
+    Invalid,
+    None,
+    VncAuth,
+    RA2,
+    RA2ne,
+    Tight,
+    Ultra,
+    Tls,
+    VeNCrypt,
+    GtkVncSasl,
+    Md5Hash,
+    ColinDeanXvp,
+    AppleRemoteDesktop,
 }
 
 impl TryFrom<u8> for SecurityType {
     type Error = VncError;
     fn try_from(num: u8) -> Result<Self, Self::Error> {
         match num {
-            0 | 1 | 2 | 5 | 6 | 16 | 17 | 18 | 19 | 20 | 21 | 22 => {
-                Ok(unsafe { std::mem::transmute::<u8, SecurityType>(num) })
-            }
+            0 => Ok(SecurityType::Invalid),
+            1 => Ok(SecurityType::None),
+            2 => Ok(SecurityType::VncAuth),
+            5 => Ok(SecurityType::RA2),
+            6 => Ok(SecurityType::RA2ne),
+            16 => Ok(SecurityType::Tight),
+            17 => Ok(SecurityType::Ultra),
+            18 => Ok(SecurityType::Tls),
+            19 => Ok(SecurityType::VeNCrypt),
+            20 => Ok(SecurityType::GtkVncSasl),
+            21 => Ok(SecurityType::Md5Hash),
+            22 => Ok(SecurityType::ColinDeanXvp),
+            30 => Ok(SecurityType::AppleRemoteDesktop),
             invalid => Err(VncError::InvalidSecurityTyep(invalid)),
         }
     }
@@ -34,7 +44,21 @@ impl TryFrom<u8> for SecurityType {
 
 impl From<SecurityType> for u8 {
     fn from(e: SecurityType) -> Self {
-        e as u8
+        match e {
+            SecurityType::Invalid => 0,
+            SecurityType::None => 1,
+            SecurityType::VncAuth => 2,
+            SecurityType::RA2 => 5,
+            SecurityType::RA2ne => 6,
+            SecurityType::Tight => 16,
+            SecurityType::Ultra => 17,
+            SecurityType::Tls => 18,
+            SecurityType::VeNCrypt => 19,
+            SecurityType::GtkVncSasl => 20,
+            SecurityType::Md5Hash => 21,
+            SecurityType::ColinDeanXvp => 22,
+            SecurityType::AppleRemoteDesktop => 30,
+        }
     }
 }
 
@@ -56,13 +80,6 @@ impl SecurityType {
                 Ok(vec![security_type])
             }
             _ => {
-                // +--------------------------+-------------+--------------------------+
-                // | No. of bytes             | Type        | Description              |
-                // |                          | [Value]     |                          |
-                // +--------------------------+-------------+--------------------------+
-                // | 1                        | U8          | number-of-security-types |
-                // | number-of-security-types | U8 array    | security-types           |
-                // +--------------------------+-------------+--------------------------+
                 let num = reader.read_u8().await?;
 
                 if num == 0 {
@@ -91,21 +108,26 @@ impl SecurityType {
 }
 
 #[allow(dead_code)]
-#[repr(u32)]
 pub(super) enum AuthResult {
-    Ok = 0,
-    Failed = 1,
+    Ok,
+    Failed,
 }
 
 impl From<u32> for AuthResult {
     fn from(num: u32) -> Self {
-        unsafe { std::mem::transmute(num) }
+        match num {
+            0 => AuthResult::Ok,
+            _ => AuthResult::Failed,
+        }
     }
 }
 
 impl From<AuthResult> for u32 {
     fn from(e: AuthResult) -> Self {
-        e as u32
+        match e {
+            AuthResult::Ok => 0,
+            AuthResult::Failed => 1,
+        }
     }
 }
 

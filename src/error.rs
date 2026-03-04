@@ -11,6 +11,8 @@ pub enum VncError {
     InvalidSecurityTyep(u8),
     #[error("Wrong password")]
     WrongPassword,
+    #[error("ARD authentication requires username and password")]
+    ArdCredentialsRequired,
     #[error("Connect error with unknown reason")]
     ConnectError,
     #[error("Unknown pixel format")]
