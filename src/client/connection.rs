@@ -64,7 +64,6 @@ struct VncInner {
     name: String,
     screen: (u16, u16),
     input_ch: Sender<ClientMsg>,
-    output_ch: Receiver<VncEvent>,
     decoding_stop: Option<oneshot::Sender<()>>,
     net_conn_stop: Option<oneshot::Sender<()>>,
     closed: bool,
@@ -78,7 +77,7 @@ impl VncInner {
         shared: bool,
         mut pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
-    ) -> Result<Self, VncError>
+    ) -> Result<(Self, Receiver<VncEvent>), VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -159,15 +158,17 @@ impl VncInner {
         });
 
         info!("VNC Client {name} starts");
-        Ok(Self {
-            name,
-            screen: (width, height),
-            input_ch: input_ch_tx,
-            output_ch: output_ch_rx,
-            decoding_stop: Some(decoding_stop_tx),
-            net_conn_stop: Some(net_conn_stop_tx),
-            closed: false,
-        })
+        Ok((
+            Self {
+                name,
+                screen: (width, height),
+                input_ch: input_ch_tx,
+                decoding_stop: Some(decoding_stop_tx),
+                net_conn_stop: Some(net_conn_stop_tx),
+                closed: false,
+            },
+            output_ch_rx,
+        ))
     }
 
     async fn input(&mut self, event: X11Event) -> Result<(), VncError> {
@@ -204,36 +205,6 @@ impl VncInner {
         }
     }
 
-    async fn recv_event(&mut self) -> Result<VncEvent, VncError> {
-        if self.closed {
-            Err(VncError::ClientNotRunning)
-        } else {
-            match self.output_ch.recv().await {
-                Some(e) => Ok(e),
-                None => {
-                    self.closed = true;
-                    Err(VncError::ClientNotRunning)
-                }
-            }
-        }
-    }
-
-    async fn poll_event(&mut self) -> Result<Option<VncEvent>, VncError> {
-        if self.closed {
-            Err(VncError::ClientNotRunning)
-        } else {
-            match self.output_ch.try_recv() {
-                Err(TryRecvError::Disconnected) => {
-                    self.closed = true;
-                    Err(VncError::ClientNotRunning)
-                }
-                Err(TryRecvError::Empty) => Ok(None),
-                Ok(e) => Ok(Some(e)),
-            }
-            // Ok(self.output_ch.recv().await)
-        }
-    }
-
     /// Stop the VNC engine and release resources
     ///
     fn close(&mut self) -> Result<(), VncError> {
@@ -259,6 +230,11 @@ impl Drop for VncInner {
 
 pub struct VncClient {
     inner: Arc<Mutex<VncInner>>,
+    /// Output channel behind its own dedicated mutex so that `recv_event()`
+    /// can await new events without holding the inner lock.  This lets
+    /// `input()` (which needs the inner lock) proceed freely while the
+    /// consumer is blocked waiting for the server to send data.
+    output_rx: Arc<Mutex<Receiver<VncEvent>>>,
 }
 
 impl VncClient {
@@ -271,10 +247,11 @@ impl VncClient {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let (inner, output_ch_rx) =
+            VncInner::new(stream, shared, pixel_format, encodings).await?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings).await?,
-            )),
+            inner: Arc::new(Mutex::new(inner)),
+            output_rx: Arc::new(Mutex::new(output_ch_rx)),
         })
     }
 
@@ -284,17 +261,26 @@ impl VncClient {
         self.inner.lock().await.input(event).await
     }
 
-    /// Receive a `VncEvent` from the engine
-    /// This function will block until a `VncEvent` is received
+    /// Receive the next `VncEvent` from the server, suspending the caller
+    /// until one is available.
     ///
+    /// Unlike the old `recv_event` implementation this does **not** hold the
+    /// inner lock while waiting, so `input()` remains fully available even
+    /// when the server is idle.
     pub async fn recv_event(&self) -> Result<VncEvent, VncError> {
-        self.inner.lock().await.recv_event().await
+        let mut rx = self.output_rx.lock().await;
+        rx.recv().await.ok_or(VncError::ClientNotRunning)
     }
 
-    /// polling `VncEvent` from the engine and give it to the client
-    ///
+    /// Non-blocking poll: returns the next queued `VncEvent` if one is
+    /// immediately available, or `Ok(None)` if the queue is empty.
     pub async fn poll_event(&self) -> Result<Option<VncEvent>, VncError> {
-        self.inner.lock().await.poll_event().await
+        let mut rx = self.output_rx.lock().await;
+        match rx.try_recv() {
+            Ok(e) => Ok(Some(e)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(VncError::ClientNotRunning),
+        }
     }
 
     /// Stop the VNC engine and release resources
@@ -308,6 +294,7 @@ impl Clone for VncClient {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            output_rx: self.output_rx.clone(),
         }
     }
 }
