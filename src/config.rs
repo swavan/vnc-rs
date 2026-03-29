@@ -59,11 +59,17 @@ impl From<[u8; 12]> for VncVersion {
             b"RFB 003.003\n" => VncVersion::RFB33,
             b"RFB 003.007\n" => VncVersion::RFB37,
             b"RFB 003.008\n" => VncVersion::RFB38,
-            // https://www.rfc-editor.org/rfc/rfc6143#section-7.1.1
-            //  Other version numbers are reported by some servers and clients,
-            //  but should be interpreted as 3.3 since they do not implement the
-            //  different handshake in 3.7 or 3.8.
-            _ => VncVersion::RFB33,
+            // RFC 6143 says unknown versions should be treated as 3.3, but that
+            // guidance predates macOS Screen Sharing's "RFB 003.889" version,
+            // which uses the RFB 3.8 security-type negotiation format (count byte
+            // + list).  Responding with "003.003" causes a protocol mismatch:
+            // macOS sends an RFB 3.8-style security list while vnc-rs tries to
+            // read a single u32 → hang / deadlock.
+            //
+            // The safe default is to reply with our highest supported version
+            // (3.8): servers that truly only understand 3.3 are exceedingly rare
+            // and are handled by the security-type fallback path anyway.
+            _ => VncVersion::RFB38,
         }
     }
 }

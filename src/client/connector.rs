@@ -54,7 +54,11 @@ where
                     let security_types =
                         SecurityType::read(&mut connector.stream, &connector.rfb_version).await?;
 
-                    assert!(!security_types.is_empty());
+                    if security_types.is_empty() {
+                        return Err(VncError::General(
+                            "Server offered no supported security types".to_string(),
+                        ));
+                    }
 
                     if security_types.contains(&SecurityType::None) {
                         // No authentication needed
