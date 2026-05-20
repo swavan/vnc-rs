@@ -35,6 +35,12 @@ tokio-stream = "0.1"
 num-bigint = { version = "0.4", features = ["rand"] }
 num-traits = "0.2"
 aes = "0.8"
+# RustCrypto's audited DES (used by VNC-AUTH's challenge/response).
+# Replaces an in-tree hand-rolled DES that misencrypted against
+# libvncserver-based servers (gnome-remote-desktop in `password` mode)
+# — visible as `password check failed!` even with the correct password.
+des = "0.8"
+cipher = "0.4"
 md-5 = "0.10"
 rand = "0.8"
 
