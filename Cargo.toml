@@ -49,6 +49,11 @@ tokio = { version = "^1", features = ["full"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+# `rand` (transitively pulled by ARD auth's `num-bigint` and by direct
+# use in the security path) pulls `getrandom`, which refuses to
+# compile for wasm*-unknown-unknown without the `js` feature. Enable
+# it explicitly on wasm only so native targets stay lean.
+getrandom = { version = "0.2", features = ["js"] }
 tokio = { version = "^1", features = [
     "sync",
     "macros",
