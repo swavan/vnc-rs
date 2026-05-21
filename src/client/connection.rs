@@ -1,6 +1,7 @@
 use futures::TryStreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::{future::Future, sync::Arc, vec};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -62,7 +63,16 @@ impl ImageRect {
 
 struct VncInner {
     name: String,
-    screen: (u16, u16),
+    // Reactive framebuffer dimensions. The server can resize the
+    // framebuffer at any time via the DesktopSize pseudo-encoding
+    // (RFB 6.7 §-223). Storing the dimensions in shared atomics lets
+    // the decoder task update them when a SetDesktopSize rect arrives
+    // and the input task observe the new values when forming the
+    // FramebufferUpdateRequest for FullRefresh / Refresh — otherwise
+    // FullRefresh would forever ask for the original handshake size
+    // and the newly exposed area of an upscaled framebuffer would
+    // never be requested or painted.
+    screen: Arc<(AtomicU16, AtomicU16)>,
     input_ch: Sender<ClientMsg>,
     decoding_stop: Option<oneshot::Sender<()>>,
     net_conn_stop: Option<oneshot::Sender<()>>,
@@ -114,6 +124,33 @@ impl VncInner {
             ))
             .await?;
 
+        // Shared, reactive framebuffer dimensions — see the comment on
+        // `VncInner::screen`. Initialised to the server's handshake
+        // size; the decoder task updates these atomics whenever a
+        // DesktopSize pseudo-encoding rect arrives.
+        //
+        // Relaxed ordering throughout: the only invariant we need is
+        // that the input task observes *some* value of the screen
+        // dims when forming a FramebufferUpdateRequest, and that it
+        // eventually observes the latest write after the decoder
+        // updates them. There is no other shared state whose
+        // happens-before relationship depends on the screen-dim
+        // store (the decoder's `output_func(SetResolution)` channel
+        // send carries its own synchronisation for downstream
+        // consumers; the input task is purely a reader of the
+        // atomic). Promoting to AcqRel/SeqCst would buy nothing and
+        // cost a memory barrier per request on the hot path.
+        let screen = Arc::new((AtomicU16::new(width), AtomicU16::new(height)));
+        let decoder_screen = screen.clone();
+        // Decoder also needs a back-channel into the input pipeline so
+        // it can self-request a non-incremental full refresh the
+        // instant DesktopSize updates the dims — otherwise the server
+        // keeps shipping incremental updates for the old (smaller)
+        // rect and the newly exposed area never paints. We hand it
+        // its own input_ch_tx clone (cheap; tokio mpsc Sender is an
+        // Arc internally).
+        let decoder_input_tx = input_ch_tx.clone();
+
         // start the decoding thread
         spawn(async move {
             trace!("Decoding thread starts");
@@ -128,8 +165,15 @@ impl VncInner {
             };
 
             let pf = pixel_format.as_ref().unwrap();
-            if let Err(e) =
-                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, decoding_stop_rx).await
+            if let Err(e) = asycn_vnc_read_loop(
+                &mut conn_ch_rx,
+                pf,
+                &output_func,
+                decoding_stop_rx,
+                decoder_screen,
+                decoder_input_tx,
+            )
+            .await
             {
                 if let VncError::IoError(e) = e {
                     if let std::io::ErrorKind::UnexpectedEof = e.kind() {
@@ -161,7 +205,7 @@ impl VncInner {
         Ok((
             Self {
                 name,
-                screen: (width, height),
+                screen,
                 input_ch: input_ch_tx,
                 decoding_stop: Some(decoding_stop_tx),
                 net_conn_stop: Some(net_conn_stop_tx),
@@ -175,13 +219,18 @@ impl VncInner {
         if self.closed {
             Err(VncError::ClientNotRunning)
         } else {
+            // Re-read the dimensions on every request — they may have
+            // been updated by the decoder task in response to a
+            // DesktopSize pseudo-encoding rect since the last call.
+            let cur_w = self.screen.0.load(Ordering::Relaxed);
+            let cur_h = self.screen.1.load(Ordering::Relaxed);
             let msg = match event {
                 X11Event::Refresh => ClientMsg::FramebufferUpdateRequest(
                     Rect {
                         x: 0,
                         y: 0,
-                        width: self.screen.0,
-                        height: self.screen.1,
+                        width: cur_w,
+                        height: cur_h,
                     },
                     1,
                 ),
@@ -189,8 +238,8 @@ impl VncInner {
                     Rect {
                         x: 0,
                         y: 0,
-                        width: self.screen.0,
-                        height: self.screen.1,
+                        width: cur_w,
+                        height: cur_h,
                     },
                     0, // non-incremental: server sends entire framebuffer
                 ),
@@ -374,6 +423,8 @@ async fn asycn_vnc_read_loop<S, F, Fut>(
     pf: &PixelFormat,
     output_func: &F,
     mut stop_ch: oneshot::Receiver<()>,
+    screen: Arc<(AtomicU16, AtomicU16)>,
+    input_ch: Sender<ClientMsg>,
 ) -> Result<(), VncError>
 where
     S: AsyncRead + Unpin,
@@ -429,6 +480,66 @@ where
                             cursor.decode(pf, &rect.rect, stream, output_func).await?;
                         }
                         VncEncoding::DesktopSizePseudo => {
+                            // Update the shared dimensions BEFORE emitting
+                            // the event so any FullRefresh the consumer
+                            // dispatches in response uses the new size.
+                            screen.0.store(rect.rect.width, Ordering::Relaxed);
+                            screen.1.store(rect.rect.height, Ordering::Relaxed);
+                            // Self-request a non-incremental full refresh
+                            // for the new rect immediately. Without this,
+                            // the server only ships incremental updates
+                            // (heartbeat ticker + change-driven), and any
+                            // newly exposed area of the framebuffer
+                            // (everything outside the prior dimensions)
+                            // never paints because nothing "changed"
+                            // there from the server's point of view. We
+                            // do this in-decoder rather than waiting for
+                            // the consumer to round-trip a FullRefresh
+                            // through its UI layer — that round-trip is
+                            // long enough for the operator to perceive
+                            // the screen as broken / "left-aligned"
+                            // (only the originally-painted top-left
+                            // chunk visible) before the request lands.
+                            let req = ClientMsg::FramebufferUpdateRequest(
+                                Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: rect.rect.width,
+                                    height: rect.rect.height,
+                                },
+                                0, // non-incremental
+                            );
+                            // try_send so the decoder never blocks on a
+                            // saturated input channel — that would stall
+                            // further reads from the network and we'd
+                            // miss the very updates we're trying to
+                            // prompt. We log both failure modes so a
+                            // stuck input task is visible in support
+                            // bundles:
+                            //   - Full: input task is behind; the
+                            //     periodic heartbeat ticker (every
+                            //     ~16ms in the consumer wrapper) will
+                            //     drain it shortly, and its next
+                            //     request uses the now-current screen
+                            //     dims so the missed full-refresh is
+                            //     effectively replayed within one
+                            //     tick.
+                            //   - Closed: the consumer task has gone
+                            //     away; we're shutting down anyway.
+                            match input_ch.try_send(req) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    warn!(
+                                        "DesktopSize: input channel full, \
+                                         post-resize full refresh deferred to next heartbeat"
+                                    );
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    // Consumer gone — nothing else to
+                                    // do; the decoder loop will exit
+                                    // naturally on the next iteration.
+                                }
+                            }
                             output_func(VncEvent::SetResolution(
                                 (rect.rect.width, rect.rect.height).into(),
                             ))
