@@ -247,8 +247,7 @@ impl VncClient {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (inner, output_ch_rx) =
-            VncInner::new(stream, shared, pixel_format, encodings).await?;
+        let (inner, output_ch_rx) = VncInner::new(stream, shared, pixel_format, encodings).await?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             output_rx: Arc::new(Mutex::new(output_ch_rx)),

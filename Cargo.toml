@@ -35,6 +35,12 @@ tokio-stream = "0.1"
 num-bigint = { version = "0.4", features = ["rand"] }
 num-traits = "0.2"
 aes = "0.8"
+# RustCrypto's audited DES (used by VNC-AUTH's challenge/response).
+# Replaces an in-tree hand-rolled DES that misencrypted against
+# libvncserver-based servers (gnome-remote-desktop in `password` mode)
+# — visible as `password check failed!` even with the correct password.
+des = "0.8"
+cipher = "0.4"
 md-5 = "0.10"
 rand = "0.8"
 
@@ -43,6 +49,11 @@ tokio = { version = "^1", features = ["full"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+# `rand` (transitively pulled by ARD auth's `num-bigint` and by direct
+# use in the security path) pulls `getrandom`, which refuses to
+# compile for wasm*-unknown-unknown without the `js` feature. Enable
+# it explicitly on wasm only so native targets stay lean.
+getrandom = { version = "0.2", features = ["js"] }
 tokio = { version = "^1", features = [
     "sync",
     "macros",
