@@ -26,8 +26,8 @@
 // straightforward.
 #![allow(dead_code)]
 
+use des::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use des::Des;
-use des::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 
 pub type Key = [u8; 8];
 
